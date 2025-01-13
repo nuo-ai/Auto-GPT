@@ -38,7 +38,7 @@ def create_test_graph() -> graph.Graph:
         graph.Node(
             block_id=FillTextTemplateBlock().id,
             input_default={
-                "format": "{a}, {b}{c}",
+                "format": "{{a}}, {{b}}{{c}}",
                 "values_#_c": "!!!",
             },
         ),
@@ -78,7 +78,7 @@ async def sample_agent():
         test_user = await create_test_user()
         test_graph = await create_graph(create_test_graph(), test_user.id)
         input_data = {"input_1": "Hello", "input_2": "World"}
-        response = await server.agent_server.execute_graph(
+        response = await server.agent_server.test_execute_graph(
             test_graph.id, input_data, test_user.id
         )
         print(response)

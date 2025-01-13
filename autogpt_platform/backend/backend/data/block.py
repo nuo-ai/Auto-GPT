@@ -15,13 +15,20 @@ from typing import (
 
 import jsonref
 import jsonschema
-from autogpt_libs.supabase_integration_credentials_store.types import Credentials
 from prisma.models import AgentBlock
 from pydantic import BaseModel
 
 from backend.util import json
+from backend.util.settings import Config
 
-from .model import CREDENTIALS_FIELD_NAME, ContributorDetails, CredentialsMetaInput
+from .model import (
+    ContributorDetails,
+    Credentials,
+    CredentialsMetaInput,
+    is_credentials_field_name,
+)
+
+app_config = Config()
 
 BlockData = tuple[str, Any]  # Input & Output data should be a tuple of (name, data).
 BlockInput = dict[str, Any]  # Input: 1 input pin consumes 1 data.
@@ -34,6 +41,9 @@ class BlockType(Enum):
     INPUT = "Input"
     OUTPUT = "Output"
     NOTE = "Note"
+    WEBHOOK = "Webhook"
+    WEBHOOK_MANUAL = "Webhook (manual)"
+    AGENT = "Agent"
 
 
 class BlockCategory(Enum):
@@ -48,13 +58,19 @@ class BlockCategory(Enum):
     COMMUNICATION = "Block that interacts with communication platforms."
     DEVELOPER_TOOLS = "Developer tools such as GitHub blocks."
     DATA = "Block that interacts with structured data."
+    HARDWARE = "Block that interacts with hardware."
+    AGENT = "Block that interacts with other agents."
+    CRM = "Block that interacts with CRM services."
+    SAFETY = (
+        "Block that provides AI safety mechanisms such as detecting harmful content"
+    )
 
     def dict(self) -> dict[str, str]:
         return {"category": self.name, "description": self.value}
 
 
 class BlockSchema(BaseModel):
-    cached_jsonschema: ClassVar[dict[str, Any]] = {}
+    cached_jsonschema: ClassVar[dict[str, Any]]
 
     @classmethod
     def jsonschema(cls) -> dict[str, Any]:
@@ -79,28 +95,16 @@ class BlockSchema(BaseModel):
                 }
             elif isinstance(obj, list):
                 return [ref_to_dict(item) for item in obj]
+
             return obj
 
         cls.cached_jsonschema = cast(dict[str, Any], ref_to_dict(model))
-
-        # Set default properties values
-        for field in cls.cached_jsonschema.get("properties", {}).values():
-            if isinstance(field, dict) and "advanced" not in field:
-                field["advanced"] = True
 
         return cls.cached_jsonschema
 
     @classmethod
     def validate_data(cls, data: BlockInput) -> str | None:
-        """
-        Validate the data against the schema.
-        Returns the validation error message if the data does not match the schema.
-        """
-        try:
-            jsonschema.validate(data, cls.jsonschema())
-            return None
-        except jsonschema.ValidationError as e:
-            return str(e)
+        return json.validate_with_jsonschema(schema=cls.jsonschema(), data=data)
 
     @classmethod
     def validate_field(cls, field_name: str, data: BlockInput) -> str | None:
@@ -137,13 +141,38 @@ class BlockSchema(BaseModel):
     @classmethod
     def __pydantic_init_subclass__(cls, **kwargs):
         """Validates the schema definition. Rules:
-        - Only one `CredentialsMetaInput` field may be present.
-          - This field MUST be called `credentials`.
-        - A field that is called `credentials` MUST be a `CredentialsMetaInput`.
+        - Fields with annotation `CredentialsMetaInput` MUST be
+          named `credentials` or `*_credentials`
+        - Fields named `credentials` or `*_credentials` MUST be
+          of type `CredentialsMetaInput`
         """
         super().__pydantic_init_subclass__(**kwargs)
-        credentials_fields = [
-            field_name
+
+        # Reset cached JSON schema to prevent inheriting it from parent class
+        cls.cached_jsonschema = {}
+
+        credentials_fields = cls.get_credentials_fields()
+
+        for field_name in cls.get_fields():
+            if is_credentials_field_name(field_name):
+                if field_name not in credentials_fields:
+                    raise TypeError(
+                        f"Credentials field '{field_name}' on {cls.__qualname__} "
+                        f"is not of type {CredentialsMetaInput.__name__}"
+                    )
+
+                credentials_fields[field_name].validate_credentials_field_schema(cls)
+
+            elif field_name in credentials_fields:
+                raise KeyError(
+                    f"Credentials field '{field_name}' on {cls.__qualname__} "
+                    "has invalid name: must be 'credentials' or *_credentials"
+                )
+
+    @classmethod
+    def get_credentials_fields(cls) -> dict[str, type[CredentialsMetaInput]]:
+        return {
+            field_name: info.annotation
             for field_name, info in cls.model_fields.items()
             if (
                 inspect.isclass(info.annotation)
@@ -152,27 +181,7 @@ class BlockSchema(BaseModel):
                     CredentialsMetaInput,
                 )
             )
-        ]
-        if len(credentials_fields) > 1:
-            raise ValueError(
-                f"{cls.__qualname__} can only have one CredentialsMetaInput field"
-            )
-        elif (
-            len(credentials_fields) == 1
-            and credentials_fields[0] != CREDENTIALS_FIELD_NAME
-        ):
-            raise ValueError(
-                f"CredentialsMetaInput field on {cls.__qualname__} "
-                "must be named 'credentials'"
-            )
-        elif (
-            len(credentials_fields) == 0
-            and CREDENTIALS_FIELD_NAME in cls.model_fields.keys()
-        ):
-            raise TypeError(
-                f"Field 'credentials' on {cls.__qualname__} "
-                f"must be of type {CredentialsMetaInput.__name__}"
-            )
+        }
 
 
 BlockSchemaInputType = TypeVar("BlockSchemaInputType", bound=BlockSchema)
@@ -181,6 +190,56 @@ BlockSchemaOutputType = TypeVar("BlockSchemaOutputType", bound=BlockSchema)
 
 class EmptySchema(BlockSchema):
     pass
+
+
+# --8<-- [start:BlockWebhookConfig]
+class BlockManualWebhookConfig(BaseModel):
+    """
+    Configuration model for webhook-triggered blocks on which
+    the user has to manually set up the webhook at the provider.
+    """
+
+    provider: str
+    """The service provider that the webhook connects to"""
+
+    webhook_type: str
+    """
+    Identifier for the webhook type. E.g. GitHub has repo and organization level hooks.
+
+    Only for use in the corresponding `WebhooksManager`.
+    """
+
+    event_filter_input: str = ""
+    """
+    Name of the block's event filter input.
+    Leave empty if the corresponding webhook doesn't have distinct event/payload types.
+    """
+
+    event_format: str = "{event}"
+    """
+    Template string for the event(s) that a block instance subscribes to.
+    Applied individually to each event selected in the event filter input.
+
+    Example: `"pull_request.{event}"` -> `"pull_request.opened"`
+    """
+
+
+class BlockWebhookConfig(BlockManualWebhookConfig):
+    """
+    Configuration model for webhook-triggered blocks for which
+    the webhook can be automatically set up through the provider's API.
+    """
+
+    resource_format: str
+    """
+    Template string for the resource that a block instance subscribes to.
+    Fields will be filled from the block's inputs (except `payload`).
+
+    Example: `f"{repo}/pull_requests"` (note: not how it's actually implemented)
+
+    Only for use in the corresponding `WebhooksManager`.
+    """
+    # --8<-- [end:BlockWebhookConfig]
 
 
 class Block(ABC, Generic[BlockSchemaInputType, BlockSchemaOutputType]):
@@ -195,10 +254,11 @@ class Block(ABC, Generic[BlockSchemaInputType, BlockSchemaOutputType]):
         test_input: BlockInput | list[BlockInput] | None = None,
         test_output: BlockData | list[BlockData] | None = None,
         test_mock: dict[str, Any] | None = None,
-        test_credentials: Optional[Credentials] = None,
+        test_credentials: Optional[Credentials | dict[str, Credentials]] = None,
         disabled: bool = False,
         static_output: bool = False,
         block_type: BlockType = BlockType.STANDARD,
+        webhook_config: Optional[BlockWebhookConfig | BlockManualWebhookConfig] = None,
     ):
         """
         Initialize the block with the given schema.
@@ -230,6 +290,57 @@ class Block(ABC, Generic[BlockSchemaInputType, BlockSchemaOutputType]):
         self.disabled = disabled
         self.static_output = static_output
         self.block_type = block_type
+        self.webhook_config = webhook_config
+        self.execution_stats = {}
+
+        if self.webhook_config:
+            if isinstance(self.webhook_config, BlockWebhookConfig):
+                # Enforce presence of credentials field on auto-setup webhook blocks
+                if not (cred_fields := self.input_schema.get_credentials_fields()):
+                    raise TypeError(
+                        "credentials field is required on auto-setup webhook blocks"
+                    )
+                # Disallow multiple credentials inputs on webhook blocks
+                elif len(cred_fields) > 1:
+                    raise ValueError(
+                        "Multiple credentials inputs not supported on webhook blocks"
+                    )
+
+                self.block_type = BlockType.WEBHOOK
+            else:
+                self.block_type = BlockType.WEBHOOK_MANUAL
+
+            # Enforce shape of webhook event filter, if present
+            if self.webhook_config.event_filter_input:
+                event_filter_field = self.input_schema.model_fields[
+                    self.webhook_config.event_filter_input
+                ]
+                if not (
+                    isinstance(event_filter_field.annotation, type)
+                    and issubclass(event_filter_field.annotation, BaseModel)
+                    and all(
+                        field.annotation is bool
+                        for field in event_filter_field.annotation.model_fields.values()
+                    )
+                ):
+                    raise NotImplementedError(
+                        f"{self.name} has an invalid webhook event selector: "
+                        "field must be a BaseModel and all its fields must be boolean"
+                    )
+
+            # Enforce presence of 'payload' input
+            if "payload" not in self.input_schema.model_fields:
+                raise TypeError(
+                    f"{self.name} is webhook-triggered but has no 'payload' input"
+                )
+
+            # Disable webhook-triggered block if webhook functionality not available
+            if not app_config.platform_base_url:
+                self.disabled = True
+
+    @classmethod
+    def create(cls: Type["Block"]) -> "Block":
+        return cls()
 
     @abstractmethod
     def run(self, input_data: BlockSchemaInputType, **kwargs) -> BlockOutput:
@@ -243,6 +354,26 @@ class Block(ABC, Generic[BlockSchemaInputType, BlockSchemaOutputType]):
             output_data: The data for the output_name, matching the defined schema.
         """
         pass
+
+    def run_once(self, input_data: BlockSchemaInputType, output: str, **kwargs) -> Any:
+        for name, data in self.run(input_data, **kwargs):
+            if name == output:
+                return data
+        raise ValueError(f"{self.name} did not produce any output for {output}")
+
+    def merge_stats(self, stats: dict[str, Any]) -> dict[str, Any]:
+        for key, value in stats.items():
+            if isinstance(value, dict):
+                self.execution_stats.setdefault(key, {}).update(value)
+            elif isinstance(value, (int, float)):
+                self.execution_stats.setdefault(key, 0)
+                self.execution_stats[key] += value
+            elif isinstance(value, list):
+                self.execution_stats.setdefault(key, [])
+                self.execution_stats[key].extend(value)
+            else:
+                self.execution_stats[key] = value
+        return self.execution_stats
 
     @property
     def name(self):
@@ -274,7 +405,9 @@ class Block(ABC, Generic[BlockSchemaInputType, BlockSchemaOutputType]):
         ):
             if output_name == "error":
                 raise RuntimeError(output_data)
-            if error := self.output_schema.validate_field(output_name, output_data):
+            if self.block_type == BlockType.STANDARD and (
+                error := self.output_schema.validate_field(output_name, output_data)
+            ):
                 raise ValueError(f"Block produced an invalid output data: {error}")
             yield output_name, output_data
 
@@ -282,14 +415,15 @@ class Block(ABC, Generic[BlockSchemaInputType, BlockSchemaOutputType]):
 # ======================= Block Helper Functions ======================= #
 
 
-def get_blocks() -> dict[str, Block]:
+def get_blocks() -> dict[str, Type[Block]]:
     from backend.blocks import AVAILABLE_BLOCKS  # noqa: E402
 
     return AVAILABLE_BLOCKS
 
 
 async def initialize_blocks() -> None:
-    for block in get_blocks().values():
+    for cls in get_blocks().values():
+        block = cls()
         existing_block = await AgentBlock.prisma().find_first(
             where={"OR": [{"id": block.id}, {"name": block.name}]}
         )
@@ -324,4 +458,5 @@ async def initialize_blocks() -> None:
 
 
 def get_block(block_id: str) -> Block | None:
-    return get_blocks().get(block_id)
+    cls = get_blocks().get(block_id)
+    return cls() if cls else None
