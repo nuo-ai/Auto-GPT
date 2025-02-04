@@ -1,6 +1,6 @@
 import logging
+from typing import Optional
 
-from autogpt_libs.supabase_integration_credentials_store import OAuth2Credentials
 from google.auth.external_account_authorized_user import (
     Credentials as ExternalAccountCredentials,
 )
@@ -8,6 +8,9 @@ from google.auth.transport.requests import AuthorizedSession, Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import Flow
 from pydantic import SecretStr
+
+from backend.data.model import OAuth2Credentials
+from backend.integrations.providers import ProviderName
 
 from .base import BaseOAuthHandler
 
@@ -20,7 +23,7 @@ class GoogleOAuthHandler(BaseOAuthHandler):
     Based on the documentation at https://developers.google.com/identity/protocols/oauth2/web-server
     """  # noqa
 
-    PROVIDER_NAME = "google"
+    PROVIDER_NAME = ProviderName.GOOGLE
     EMAIL_ENDPOINT = "https://www.googleapis.com/oauth2/v2/userinfo"
     DEFAULT_SCOPES = [
         "https://www.googleapis.com/auth/userinfo.email",
@@ -34,8 +37,11 @@ class GoogleOAuthHandler(BaseOAuthHandler):
         self.client_secret = client_secret
         self.redirect_uri = redirect_uri
         self.token_uri = "https://oauth2.googleapis.com/token"
+        self.revoke_uri = "https://oauth2.googleapis.com/revoke"
 
-    def get_login_url(self, scopes: list[str], state: str) -> str:
+    def get_login_url(
+        self, scopes: list[str], state: str, code_challenge: Optional[str]
+    ) -> str:
         all_scopes = list(set(scopes + self.DEFAULT_SCOPES))
         logger.debug(f"Setting up OAuth flow with scopes: {all_scopes}")
         flow = self._setup_oauth_flow(all_scopes)
@@ -49,7 +55,7 @@ class GoogleOAuthHandler(BaseOAuthHandler):
         return authorization_url
 
     def exchange_code_for_tokens(
-        self, code: str, scopes: list[str]
+        self, code: str, scopes: list[str], code_verifier: Optional[str]
     ) -> OAuth2Credentials:
         logger.debug(f"Exchanging code for tokens with scopes: {scopes}")
 
@@ -99,6 +105,15 @@ class GoogleOAuthHandler(BaseOAuthHandler):
         )
 
         return credentials
+
+    def revoke_tokens(self, credentials: OAuth2Credentials) -> bool:
+        session = AuthorizedSession(credentials)
+        session.post(
+            self.revoke_uri,
+            params={"token": credentials.access_token.get_secret_value()},
+            headers={"content-type": "application/x-www-form-urlencoded"},
+        )
+        return True
 
     def _request_email(
         self, creds: Credentials | ExternalAccountCredentials
